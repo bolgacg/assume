@@ -4,6 +4,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -230,10 +231,10 @@ def test_get_lat_lon_area(mock_infrastructure):
 
 
 def test_get_solar_systems_in_area_power_cap_threshold(mock_infrastructure):
-    # A system with 120 kWp installed capacity and a 70% feed-in limit is
-    # scaled to 84 kWp in maxPower, but must still qualify for direct
-    # marketing based on its installed capacity (120 kWp > 100 kWp
-    # threshold), not the already-limited maxPower.
+    # A system with 120 kWp installed capacity and a 70% feed-in limit
+    # keeps its installed capacity in maxPower (the limit is applied as a
+    # peak clip in get_solar_series) and must still qualify for direct
+    # marketing (installed 120 kWp > 100 kWp threshold).
     raw_df = pd.DataFrame(
         {
             "unitID": ["SEE12345"],
@@ -258,9 +259,9 @@ def test_get_solar_systems_in_area_power_cap_threshold(mock_infrastructure):
     with patch("pandas.read_sql", return_value=raw_df):
         result = mock_infrastructure.get_solar_systems_in_area(area=52353)
 
-        # maxPower is scaled by the feed-in limit: 120 * 0.7 = 84.0
-        assert result["maxPower"].iloc[0] == pytest.approx(84.0)
-        # demandP is in W: 84.0 * 1000 = 84000.0
+        # maxPower keeps the installed (pre-limit) capacity
+        assert result["maxPower"].iloc[0] == pytest.approx(120.0)
+        # demandP reflects the clipped peak: 120 * 0.7 * 1000 = 84000.0 W
         assert result["demandP"].iloc[0] == pytest.approx(84000.0)
         # limit_factor is carried for get_solar_series
         assert result["limit_factor"].iloc[0] == 0.7
@@ -336,8 +337,7 @@ def test_get_solar_systems_in_area_ost_west_split_after_size_rules(
     mock_infrastructure,
 ):
     # a 50 kWp Ost-West unit must get the 70% feed-in limit for units
-    # above 30 kWp before it is scaled and split into two 17.5 kWp rows
-    # (50 * 0.7 / 2)
+    # above 30 kWp before it is split into two 25 kWp rows
     raw_df = pd.DataFrame(
         {
             "unitID": ["SEE10001"],
@@ -362,7 +362,7 @@ def test_get_solar_systems_in_area_ost_west_split_after_size_rules(
     with patch("pandas.read_sql", return_value=raw_df):
         result = mock_infrastructure.get_solar_systems_in_area(area=52353)
 
-    assert result["maxPower"].tolist() == [17.5, 17.5]
+    assert result["maxPower"].tolist() == [25.0, 25.0]
     assert result["limit_factor"].tolist() == [0.7, 0.7]
     assert result["tilt"].tolist() == ["30", "30"]
 
@@ -400,3 +400,132 @@ def test_get_solar_storage_ost_west_split_keeps_battery_totals(mock_infrastructu
     assert result["maxPower"].sum() == pytest.approx(10.0)
     assert result["batPower"].sum() == pytest.approx(5.0)
     assert result["VMax"].sum() == pytest.approx(8.0)
+
+
+def test_get_solar_series_applies_feed_in_limit_as_peak_clip():
+    # A limited system must keep its rated capacity in maxPower but its
+    # series must be clipped at limit_factor * rated, not scaled by it.
+    from assume.scenario.oeds.infrastructure import get_solar_series
+
+    index = pd.date_range("2020-06-21", periods=3, freq="h", tz="Europe/Berlin")
+    weather_df = pd.DataFrame(
+        {
+            "zenith": [93.0, 10.0, 93.0],
+            "azimuth": [180.0, 180.0, 180.0],
+            "dni": [0.0, 900.0, 0.0],
+            "ghi": [50.0, 450.0, 50.0],
+            "dhi": np.zeros(3),
+        },
+        index=index,
+    )
+
+    rated = 100.0
+    unlimited = pd.DataFrame({"azimuth": ["180"], "tilt": ["30"], "maxPower": [rated]})
+    solar_open, _ = get_solar_series(unlimited, weather_df, inverter_efficiency=1.0)
+    open_kw = solar_open.to_numpy()
+    assert open_kw.max() > 0
+
+    # MaStR semantics: output is clipped at limit_factor * rated power
+    factor = 0.8
+    expected = np.minimum(open_kw, factor * rated)
+
+    systems = pd.DataFrame(
+        {
+            "azimuth": ["180"],
+            "tilt": ["30"],
+            "maxPower": [rated],
+            "limit_factor": [factor],
+        }
+    )
+    solar, _ = get_solar_series(systems, weather_df, inverter_efficiency=1.0)
+    clipped_kw = solar.to_numpy()
+    # clipped, never scaled: the shape below the clip level is unchanged,
+    # the peak sits exactly at the clip level instead of the natural peak
+    assert not np.allclose(clipped_kw, open_kw * factor)
+    assert np.allclose(clipped_kw, expected)
+    assert np.allclose(clipped_kw.max(), factor * rated)
+
+
+def test_clipped_feed_in_matches_per_unit_clip():
+    from assume.scenario.oeds.infrastructure import clipped_feed_in
+
+    rng = np.random.default_rng(0)
+    installed = rng.uniform(1, 100, 50)
+    installed[3] = 0.0  # units without capacity are ignored
+    cap = installed * rng.uniform(0.4, 1.0, 50)
+    share = np.array([0.0, 0.3, 0.6, 0.85, 1.0, 1.1])
+
+    expected = np.minimum(np.outer(share, installed), cap).sum(axis=1)
+    assert np.allclose(clipped_feed_in(share, installed, cap), expected)
+
+
+def test_get_solar_series_clips_units_at_ac_capacity():
+    # maxPower is the installed DC capacity; units with a smaller inverter
+    # (acPower) or a feed-in limit are clipped individually, even if they
+    # share an orientation group
+    from assume.scenario.oeds.infrastructure import get_solar_series
+
+    index = pd.date_range("2020-06-21", periods=3, freq="h", tz="Europe/Berlin")
+    weather_df = pd.DataFrame(
+        {
+            "zenith": [93.0, 10.0, 93.0],
+            "azimuth": [180.0, 180.0, 180.0],
+            "dni": [0.0, 900.0, 0.0],
+            "ghi": [50.0, 450.0, 50.0],
+            "dhi": np.zeros(3),
+        },
+        index=index,
+    )
+    unit = pd.DataFrame({"azimuth": ["180"], "tilt": ["30"], "maxPower": [100.0]})
+    open_kw = get_solar_series(unit, weather_df)[0].to_numpy()
+
+    systems = pd.DataFrame(
+        {
+            "azimuth": ["180", "180"],
+            "tilt": ["30", "30"],
+            "maxPower": [100.0, 100.0],
+            "acPower": [60.0, 100.0],
+            "limit_factor": [1.0, 0.7],
+        }
+    )
+    solar, _ = get_solar_series(systems, weather_df)
+    expected = np.minimum(open_kw, 60.0) + np.minimum(open_kw, 70.0)
+    assert open_kw.max() > 70.0
+    assert np.allclose(solar.to_numpy(), expected)
+
+
+def test_get_solar_series_applies_losses_and_aging_before_clip():
+    # DC output is reduced by the inverter efficiency and by linear aging
+    # at the middle of the simulated period, the AC capacity clips afterwards
+    from assume.scenario.oeds.infrastructure import get_solar_series
+
+    index = pd.date_range("2020-06-21 11:00", periods=3, freq="h")
+    weather_df = pd.DataFrame(
+        {
+            "zenith": [93.0, 10.0, 93.0],
+            "azimuth": [180.0, 180.0, 180.0],
+            "dni": [0.0, 900.0, 0.0],
+            "ghi": [50.0, 450.0, 50.0],
+            "dhi": np.zeros(3),
+        },
+        index=index,
+    )
+    unit = pd.DataFrame({"azimuth": ["180"], "tilt": ["30"], "maxPower": [100.0]})
+    lossless = get_solar_series(unit, weather_df, inverter_efficiency=1.0)[0]
+
+    # commissioned ten years before the middle of the period
+    aged = unit.assign(startDate=pd.Timestamp("2010-06-21 12:00"))
+    solar = get_solar_series(aged, weather_df, inverter_efficiency=0.9)[0]
+    expected_factor = 0.9 * (1 - 0.005 * 3653 / 365.25)
+    assert np.allclose(solar, lossless * expected_factor)
+
+    # units commissioned after the period do not gain from negative aging
+    new = unit.assign(startDate=pd.Timestamp("2021-01-01"))
+    solar = get_solar_series(new, weather_df, inverter_efficiency=0.9)[0]
+    assert np.allclose(solar, lossless * 0.9)
+
+    # the AC capacity clips the output after losses
+    capped = unit.assign(acPower=60.0)
+    solar = get_solar_series(capped, weather_df, inverter_efficiency=0.9)[0]
+    assert np.allclose(solar, np.minimum(lossless * 0.9, 60.0))
+    assert (lossless * 0.9).max() > 60.0

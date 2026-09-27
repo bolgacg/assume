@@ -36,6 +36,12 @@ WEATHER_PARAMS_ECMWF = [
 
 logger = logging.getLogger(__name__)
 
+# PV losses between the module DC rating and the AC output: inverter and
+# system losses as in the Atlite CSi panel default
+PV_INVERTER_EFFICIENCY = 0.9
+# linear PV module degradation per year of operation
+PV_AGING_RATE = 0.005
+
 # MaStR units without an Inbetriebnahmedatum (status: In Planung) leak into
 # queries that are not time-bounded, so a status filter keeps replacing the
 # old numeric "EinheitBetriebsstatus >= 35" (codes 35/37/38).
@@ -343,7 +349,8 @@ class InfrastructureInterface:
 
         query = (
             f'SELECT "EinheitMastrNummer" as "unitID", '
-            f'"Nettonennleistung" as "maxPower", '
+            f'"Bruttoleistung" as "maxPower", '
+            f'"Nettonennleistung" as "acPower", '
             f'"Laengengrad" as "lon", '
             f'"Breitengrad" as "lat", '
             f'"Postleitzahl" as "plzCode", '
@@ -438,9 +445,6 @@ class InfrastructureInterface:
         )
         df["tilt"] = map_mastr_codes(df.pop("tiltCode"), mastr_solar_tilt, "30")
 
-        # apply limit to maxPower
-        df["maxPower"] *= df["limit_factor"]
-
         # Ost-West double-row systems cannot be represented by a single
         # azimuth; split each unit into an east- and a west-facing row at
         # half capacity. The (azimuth, tilt) groupby in get_solar_series
@@ -450,7 +454,7 @@ class InfrastructureInterface:
             ew = df[ew_mask].copy()
             # halve every capacity so that totals, e.g. the battery power
             # summed in get_solar_series, are not counted twice
-            for column in ["maxPower", "batPower", "VMax"]:
+            for column in ["maxPower", "acPower", "batPower", "VMax"]:
                 if column in ew.columns:
                     ew[column] /= 2
             ew = pd.concat(
@@ -460,7 +464,14 @@ class InfrastructureInterface:
             rest = df[~ew_mask]
             df = pd.concat([rest, ew], ignore_index=True)
 
-        df["demandP"] = df["maxPower"] * 1e3
+        # maxPower keeps the installed (DC) capacity in kWp, acPower the AC
+        # capacity (Nettonennleistung = min(modules, inverters)). The feed-in
+        # limit and acPower are applied as a peak clip in get_solar_series.
+        if "acPower" not in df.columns:
+            df["acPower"] = df["maxPower"]
+        df["demandP"] = (
+            np.minimum(df["maxPower"] * df["limit_factor"], df["acPower"]) * 1e3
+        )
         return df
 
     def get_wind_turbines_in_area(
@@ -718,7 +729,8 @@ class InfrastructureInterface:
         query = f"""SELECT
 spe."LokationMastrNummer" as "unitID",
 spe."EinheitMastrNummer" as "unitMastrID",
-so."Nettonennleistung" as "maxPower",
+so."Bruttoleistung" as "maxPower",
+so."Nettonennleistung" as "acPower",
 spe."Nettonennleistung" as "batPower",
 so."Laengengrad" as "lon",
 so."Breitengrad" as "lat",
@@ -1010,25 +1022,78 @@ def get_wind_series(wind_systems: pd.DataFrame, weather_df: pd.DataFrame):
     return wind_power
 
 
-def get_solar_series(solar_systems: pd.DataFrame, weather_df: pd.DataFrame):
-    systems = []
-    solar_power = pd.Series(0, weather_df.index)
+def clipped_feed_in(share, installed, cap):
+    """
+    Sums min(share * installed, cap) over all units for every time step.
+
+    All units of an orientation group produce the same share of their
+    installed capacity, but each unit is clipped at its own feed-in cap.
+    Sorting the units by cap / installed gives the exact sum without a loop
+    over units.
+
+    Args:
+        share (numpy.ndarray): produced share of the installed capacity per time step
+        installed (numpy.ndarray): installed capacity per unit
+        cap (numpy.ndarray): maximum feed-in per unit
+
+    Returns:
+        numpy.ndarray: summed feed-in per time step
+    """
+    valid = installed > 0
+    installed, cap = installed[valid], cap[valid]
+    order = np.argsort(cap / installed)
+    ratio = (cap / installed)[order]
+    # units with ratio <= share run at their cap, the others follow share
+    capped = np.concatenate([[0.0], np.cumsum(cap[order])])
+    uncapped = installed.sum() - np.concatenate([[0.0], np.cumsum(installed[order])])
+    n_capped = np.searchsorted(ratio, share, side="right")
+    return share * uncapped[n_capped] + capped[n_capped]
+
+
+def get_solar_series(
+    solar_systems: pd.DataFrame,
+    weather_df: pd.DataFrame,
+    inverter_efficiency: float = PV_INVERTER_EFFICIENCY,
+    aging_rate: float = PV_AGING_RATE,
+):
+    """
+    Calculates the PV feed-in of the given systems in kW.
+
+    maxPower is the installed (DC) capacity in kWp. The DC output is reduced
+    by inverter_efficiency and, if startDate is given, by aging_rate per year
+    of operation at the middle of the simulated period. Each unit's AC output
+    is then clipped at its feed-in limit (limit_factor * maxPower) and its AC
+    capacity (acPower), if these columns are given.
+    """
+    solar_power = pd.Series(0.0, weather_df.index)
     battery_power = pd.Series(0, weather_df.index)
     if solar_systems.empty:
         return solar_power, battery_power
+    index = (
+        weather_df.index.tz_localize(None) if weather_df.index.tz else weather_df.index
+    )
+    mid_period = index[0] + (index[-1] - index[0]) / 2
     for info, group in tqdm(solar_systems.groupby(["azimuth", "tilt"])):
         azimuth = int(info[0])
         tilt = int(info[1])
-        maxPower = group["maxPower"].sum()  # in kW
-        # Todo: Find out how to handle East-West and "nachgeführt" systems: "https://pvlib-python.readthedocs.io/en/v0.9.0/auto_examples/plot_mixed_orientation.html"
+        installed = group["maxPower"].to_numpy(dtype=float)  # in kW
+        cap = installed.copy()
+        if "limit_factor" in group.columns:
+            cap *= group["limit_factor"].to_numpy(dtype=float)
+        if "acPower" in group.columns:
+            cap = np.minimum(cap, group["acPower"].to_numpy(dtype=float))
+        # AC output at 1e3 W/m2 after losses and aging
+        rated_ac = installed * inverter_efficiency
+        if "startDate" in group.columns:
+            age = (mid_period - pd.to_datetime(group["startDate"])).dt.days / 365.25
+            rated_ac *= 1 - aging_rate * age.clip(lower=0).to_numpy()
         if "batPower" in group.columns:
             battery_power += group["batPower"].sum()
         system = PVSystem(
             surface_tilt=tilt,
             surface_azimuth=azimuth,
-            module_parameters={"pdc0": maxPower},
+            module_parameters={"pdc0": installed.sum()},
         )
-        systems.append(system)
 
         ir = system.get_irradiance(
             solar_zenith=weather_df["zenith"],
@@ -1037,8 +1102,11 @@ def get_solar_series(solar_systems: pd.DataFrame, weather_df: pd.DataFrame):
             ghi=weather_df["ghi"],
             dhi=weather_df["dhi"],
         )
-        solar_power += ir["poa_global"] * maxPower
-    solar_power /= 1e3  # W -> kW
+        # poa_global is [W/m2]; 1e3 W/m2 corresponds to the installed capacity.
+        # feed-in limits and inverters clip the peak rather than scaling the
+        # whole curve.
+        share = ir["poa_global"].to_numpy() / 1e3
+        solar_power += clipped_feed_in(share, rated_ac, cap)
     return solar_power, battery_power
 
 
