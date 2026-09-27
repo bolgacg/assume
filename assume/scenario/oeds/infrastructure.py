@@ -109,6 +109,37 @@ class InfrastructureInterface:
         plzs = self.plz_nuts["nuts3"].str.startswith(area)
         return list(self.plz_nuts.loc[plzs].index)
 
+    def resolve_area(self, area):
+        """
+        Resolves an area to its SQL postal code list and mean location.
+
+        Args:
+            area (str | int | None): NUTS area, German postal code or None.
+                None selects all units without a postal code filter, which also
+                keeps units whose postal code is missing from the plz table.
+
+        Returns:
+            tuple: (postal code list for an SQL IN clause or None, latitude, longitude)
+        """
+        if area is None:
+            latitude, longitude = self.plz_nuts[["latitude", "longitude"]].mean()
+            return None, latitude, longitude
+
+        if isinstance(area, str) and area.startswith("DE"):
+            plz_codes = self.get_plz_codes(area)
+            if not plz_codes:
+                raise Exception("invalid areas")
+        else:
+            plz_codes = [int(area)]
+
+        for plz in plz_codes:
+            if plz not in self.plz_nuts.index:
+                raise Exception("invalid plz code")
+
+        latitude, longitude = self.get_lat_lon_area(area)
+        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
+        return f"('{plz_codes_str}')", latitude, longitude
+
     def aggregate_cchps(self, df):
         # CCHP Power Plant with Combination
         cchps = df[df["combination"] == 1]
@@ -196,7 +227,7 @@ class InfrastructureInterface:
         returns the power plants of a given area and given fuel type filtered by commission and decommission date
 
         Args:
-            area (int, optional): NUTS area or German postal code. Defaults to 52353.
+            area (int, optional): NUTS area or German postal code, None for all. Defaults to 52353.
             fuel_type (str, optional): fuel type to filter for. Defaults to "lignite".
             created_before (datetime.datetime, optional): time before which the power plants have to be created. Defaults to None.
             stopped_after (datetime.datetime, optional): time until the power plants have to be running at least. Defaults to None.
@@ -204,18 +235,7 @@ class InfrastructureInterface:
         Returns:
             pandas.DataFrame: dataframe of power plants
         """
-        if isinstance(area, str) and area.startswith("DE"):
-            plz_codes = self.get_plz_codes(area)
-            if not plz_codes:
-                raise Exception("invalid areas")
-        else:
-            plz_codes = [int(area)]
-
-        for plz in plz_codes:
-            if plz not in self.plz_nuts.index:
-                raise Exception("invalid plz code")
-
-        latitude, longitude = self.get_lat_lon_area(area)
+        plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         query = f"""
             SELECT ev."EinheitMastrNummer" as "unitID",
@@ -228,8 +248,6 @@ class InfrastructureInterface:
             COALESCE(ev."Technologie", \'Kondensationsmaschine ohne Entnahme\') as "turbineTyp",
             ev."GenMastrNummer" as "generatorID"
             """
-        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
-        plz_codes_str = f"('{plz_codes_str}')"
         if fuel_type != "nuclear":
             query += f"""
                 ,
@@ -238,16 +256,17 @@ class InfrastructureInterface:
                 ev."AnlageIstImKombibetrieb" as "combination"
                 FROM "combustion_extended" ev
                 LEFT JOIN "kwk" kwk ON kwk."KwkMastrNummer" = ev."KwkMastrNummer"
-                WHERE ev."Postleitzahl" in {plz_codes_str}
-                AND ev."Energietraeger" = \'{mastr_fuel_type[fuel_type]}\'
+                WHERE ev."Energietraeger" = \'{mastr_fuel_type[fuel_type]}\'
                 AND ev."Nettonennleistung" > 5000
                 AND ev.\"EinheitBetriebsstatus\" IN {MASTR_OPERATIONAL_STATUS}
                 """
         else:
-            query += f"""
+            query += """
                 FROM "nuclear_extended" ev
-                WHERE ev."Postleitzahl" in {plz_codes_str}
+                WHERE TRUE
                 """
+        if plz_codes_str:
+            query += f'AND ev."Postleitzahl" in {plz_codes_str} '
         if created_before:
             query += f"AND ev.\"Inbetriebnahmedatum\" < '{created_before.isoformat()}' "
         if stopped_after:
@@ -305,20 +324,7 @@ class InfrastructureInterface:
     def get_solar_systems_in_area(
         self, area=520, solar_type="roof_top", created_before=None, stopped_after=None
     ):
-        if isinstance(area, str) and area.startswith("DE"):
-            plz_codes = self.get_plz_codes(area)
-            if not plz_codes:
-                raise Exception("invalid areas")
-        else:
-            plz_codes = [int(area)]
-
-        for plz in plz_codes:
-            if plz not in self.plz_nuts.index:
-                raise Exception("invalid plz code")
-
-        latitude, longitude = self.get_lat_lon_area(area)
-        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
-        plz_codes_str = f"('{plz_codes_str}')"
+        plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         query = (
             f'SELECT "EinheitMastrNummer" as "unitID", '
@@ -326,6 +332,7 @@ class InfrastructureInterface:
             f'COALESCE("Laengengrad", {longitude}) as "lon", '
             f'COALESCE("Breitengrad", {latitude}) as "lat", '
             f'"Postleitzahl" as "plzCode", '
+            f'"Bundesland" as "state", '
             f'COALESCE("Hauptausrichtung", \'Süd\') as "azimuthCode", '
             f'"Leistungsbegrenzung" as "limited", '
             f'"Einspeisungsart" as "ownConsumption", '
@@ -334,10 +341,11 @@ class InfrastructureInterface:
             f'"InanspruchnahmeZahlungNachEeg" as "eeg" '
             f'FROM "solar_extended" '
             f'LEFT JOIN "solar_eeg" ON "EinheitMastrNummer" = "VerknuepfteEinheit" '
-            f'WHERE "Postleitzahl" in {plz_codes_str} '
-            f'AND "EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS} '
+            f'WHERE "EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS} '
         )
 
+        if plz_codes_str:
+            query += f'AND "Postleitzahl" in {plz_codes_str} '
         if solar_type:
             query += f"AND \"ArtDerSolaranlage\" = '{mastr_solar_codes[solar_type]}' "
 
@@ -415,20 +423,7 @@ class InfrastructureInterface:
     def get_wind_turbines_in_area(
         self, area=520, wind_type="on_shore", created_before=None, stopped_after=None
     ):
-        if isinstance(area, str) and area.startswith("DE"):
-            plz_codes = self.get_plz_codes(area)
-            if not plz_codes:
-                raise Exception("invalid areas")
-        else:
-            plz_codes = [int(area)]
-
-        for plz in plz_codes:
-            if plz not in self.plz_nuts.index:
-                raise Exception("invalid plz code")
-
-        latitude, longitude = self.get_lat_lon_area(area)
-        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
-        plz_codes_str = f"('{plz_codes_str}')"
+        plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         query = (
             f'SELECT "EinheitMastrNummer" as "unitID", '
@@ -436,6 +431,7 @@ class InfrastructureInterface:
             f'COALESCE("Laengengrad", {longitude}) as "lon", '
             f'COALESCE("Breitengrad", {latitude}) as "lat", '
             f'"Postleitzahl" as "plzCode", '
+            f'"Bundesland" as "state", '
             f'"Typenbezeichnung" as "typ", '
             f'COALESCE("Hersteller", \'unknown\') as "manufacturer", '
             f'"Nabenhoehe" as "height", '
@@ -449,8 +445,8 @@ class InfrastructureInterface:
             f"WHERE \"WindAnLandOderAufSee\" = '{mastr_wind_type[wind_type]}' "
             f'AND "EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS} '
         )
-        if wind_type == "on_shore":
-            query += f' AND "Postleitzahl" in {plz_codes_str} '
+        if wind_type == "on_shore" and plz_codes_str:
+            query += f'AND "Postleitzahl" in {plz_codes_str} '
 
         if created_before:
             query += f"AND \"Inbetriebnahmedatum\" < '{created_before.isoformat()}' "
@@ -473,7 +469,7 @@ class InfrastructureInterface:
         df["diameter"] = df["diameter"].fillna(df["diameter"].mean())
         # all WEA with na are on shore and not allocated to a sea cluster
         # set tag for wind farms
-        wind_farm_prefix = f"{area}0F"
+        wind_farm_prefix = f"{area or 'DE'}0F"
         df["windFarm"] = "x"
         counter = 0
         for genId in df["generatorID"].unique():
@@ -487,20 +483,7 @@ class InfrastructureInterface:
     def get_biomass_systems_in_area(
         self, area=520, created_before=None, stopped_after=None
     ):
-        if isinstance(area, str) and area.startswith("DE"):
-            plz_codes = self.get_plz_codes(area)
-            if not plz_codes:
-                raise Exception("invalid areas")
-        else:
-            plz_codes = [int(area)]
-
-        for plz in plz_codes:
-            if plz not in self.plz_nuts.index:
-                raise Exception("invalid plz code")
-
-        latitude, longitude = self.get_lat_lon_area(area)
-        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
-        plz_codes_str = f"('{plz_codes_str}')"
+        plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         # TODO: Add more Parameters, if the model get more complex
         query = (
@@ -511,9 +494,11 @@ class InfrastructureInterface:
             f'COALESCE("Laengengrad", {longitude}) as "lon", '
             f'COALESCE("Breitengrad", {latitude}) as "lat" '
             f'FROM "biomass_extended" '
-            f'WHERE "Postleitzahl" in {plz_codes_str} '
-            f'AND "EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS} '
+            f'WHERE "EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS} '
         )
+
+        if plz_codes_str:
+            query += f'AND "Postleitzahl" in {plz_codes_str} '
 
         if created_before:
             query += f"AND \"Inbetriebnahmedatum\" < '{created_before.isoformat()}' "
@@ -529,20 +514,7 @@ class InfrastructureInterface:
     def get_run_river_systems_in_area(
         self, area=520, created_before=None, stopped_after=None
     ):
-        if isinstance(area, str) and area.startswith("DE"):
-            plz_codes = self.get_plz_codes(area)
-            if not plz_codes:
-                raise Exception("invalid areas")
-        else:
-            plz_codes = [int(area)]
-
-        for plz in plz_codes:
-            if plz not in self.plz_nuts.index:
-                raise Exception("invalid plz code")
-
-        latitude, longitude = self.get_lat_lon_area(area)
-        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
-        plz_codes_str = f"('{plz_codes_str}')"
+        plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         query = (
             f'SELECT "EinheitMastrNummer" as "unitID", '
@@ -552,10 +524,12 @@ class InfrastructureInterface:
             f'COALESCE("Laengengrad", {longitude}) as "lon", '
             f'COALESCE("Breitengrad", {latitude}) as "lat" '
             f'FROM "hydro_extended" '
-            f'WHERE "Postleitzahl" in {plz_codes_str} AND '
-            f"\"ArtDerWasserkraftanlage\" = 'Laufwasseranlage' "
+            f"WHERE \"ArtDerWasserkraftanlage\" = 'Laufwasseranlage' "
             f'AND "EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS} '
         )
+
+        if plz_codes_str:
+            query += f'AND "Postleitzahl" in {plz_codes_str} '
 
         if created_before:
             query += f"AND \"Inbetriebnahmedatum\" < '{created_before.isoformat()}' "
@@ -571,20 +545,7 @@ class InfrastructureInterface:
     def get_water_storage_systems(
         self, area=800, created_before=None, stopped_after=None
     ):
-        if isinstance(area, str) and area.startswith("DE"):
-            plz_codes = self.get_plz_codes(area)
-            if not plz_codes:
-                raise Exception("invalid areas")
-        else:
-            plz_codes = [int(area)]
-
-        for plz in plz_codes:
-            if plz not in self.plz_nuts.index:
-                raise Exception("invalid plz code")
-
-        latitude, longitude = self.get_lat_lon_area(area)
-        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
-        plz_codes_str = f"('{plz_codes_str}')"
+        plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         query = (
             f'SELECT spe."EinheitMastrNummer" as "unitID", '
@@ -599,11 +560,13 @@ class InfrastructureInterface:
             f'COALESCE(spe."Breitengrad", {latitude}) as "lat" '
             f'FROM "storage_extended" spe '
             f'LEFT JOIN "storage_units" su ON spe."EinheitMastrNummer" = su."VerknuepfteEinheit" '
-            f'WHERE spe."Postleitzahl" in {plz_codes_str} AND '
-            f"spe.\"Technologie\" = 'Pumpspeicher'  AND spe.\"EinheitSystemstatus\"= 'Aktiviert' AND spe.\"Land\"= 'Deutschland' "
+            f"WHERE spe.\"Technologie\" = 'Pumpspeicher'  AND spe.\"EinheitSystemstatus\"= 'Aktiviert' AND spe.\"Land\"= 'Deutschland' "
             f'AND spe."EinheitBetriebsstatus" = {MASTR_IN_OPERATION_STATUS} '
             f'AND spe."Nettonennleistung" > 500 '
         )
+
+        if plz_codes_str:
+            query += f'AND spe."Postleitzahl" in {plz_codes_str} '
 
         if created_before:
             query += (
@@ -699,20 +662,7 @@ class InfrastructureInterface:
     def get_solar_storage_systems_in_area(
         self, area, created_before=None, stopped_after=None
     ):
-        if isinstance(area, str) and area.startswith("DE"):
-            plz_codes = self.get_plz_codes(area)
-            if not plz_codes:
-                raise Exception("invalid areas")
-        else:
-            plz_codes = [int(area)]
-
-        for plz in plz_codes:
-            if plz not in self.plz_nuts.index:
-                raise Exception("invalid plz code")
-
-        latitude, longitude = self.get_lat_lon_area(area)
-        plz_codes_str = "', '".join([f"{int(x):05d}" for x in plz_codes])
-        plz_codes_str = f"('{plz_codes_str}')"
+        plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         query = f"""SELECT
 spe."LokationMastrNummer" as "unitID",
@@ -730,9 +680,10 @@ an."NutzbareSpeicherkapazitaet" as "VMax"
 FROM "storage_extended" spe
 INNER JOIN "solar_extended" so ON spe."LokationMastrNummer" = so."LokationMastrNummer"
  INNER JOIN "storage_units" an ON spe."SpeMastrNummer" = an."MastrNummer"
-WHERE so."Postleitzahl" in {plz_codes_str}
-AND so."EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS}
+WHERE so."EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS}
 """
+        if plz_codes_str:
+            query += f'AND so."Postleitzahl" in {plz_codes_str} '
         if created_before:
             query += f"AND so.\"Inbetriebnahmedatum\" < '{created_before.isoformat()}' "
         if stopped_after:

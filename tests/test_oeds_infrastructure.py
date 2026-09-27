@@ -136,13 +136,13 @@ def test_operational_status_filter_in_queries(mock_infrastructure):
 
     OPERATIONAL = f"IN {MASTR_OPERATIONAL_STATUS}"
     expected_clauses = {
-        "solar": f'AND "EinheitBetriebsstatus" {OPERATIONAL}',
-        "wind": f'AND "EinheitBetriebsstatus" {OPERATIONAL}',
-        "biomass": f'AND "EinheitBetriebsstatus" {OPERATIONAL}',
-        "hydro": f'AND "EinheitBetriebsstatus" {OPERATIONAL}',
-        "solar_storage": f'AND so."EinheitBetriebsstatus" {OPERATIONAL}',
-        "storage": "AND spe.\"EinheitBetriebsstatus\" = 'In Betrieb'",
-        "power_plant": f'AND ev."EinheitBetriebsstatus" {OPERATIONAL}',
+        "solar": f'"EinheitBetriebsstatus" {OPERATIONAL}',
+        "wind": f'"EinheitBetriebsstatus" {OPERATIONAL}',
+        "biomass": f'"EinheitBetriebsstatus" {OPERATIONAL}',
+        "hydro": f'"EinheitBetriebsstatus" {OPERATIONAL}',
+        "solar_storage": f'so."EinheitBetriebsstatus" {OPERATIONAL}',
+        "storage": "spe.\"EinheitBetriebsstatus\" = 'In Betrieb'",
+        "power_plant": f'ev."EinheitBetriebsstatus" {OPERATIONAL}',
     }
     calls = [
         ("solar", lambda: mock_infrastructure.get_solar_systems_in_area(area=52353)),
@@ -178,6 +178,41 @@ def test_operational_status_filter_in_queries(mock_infrastructure):
             label,
             re.sub(r"\s+", " ", query)[-200:],
         )
+
+
+def test_area_none_queries_without_postal_code_filter(mock_infrastructure):
+    # area=None selects all units, so no postal code filter may be applied;
+    # a postal code area keeps the filter
+    postal_code, lat, lon = mock_infrastructure.resolve_area(None)
+    assert postal_code is None
+    assert (lat, lon) == (50.0, 6.0)
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    getters = [
+        mock_infrastructure.get_solar_systems_in_area,
+        mock_infrastructure.get_wind_turbines_in_area,
+        mock_infrastructure.get_biomass_systems_in_area,
+        mock_infrastructure.get_run_river_systems_in_area,
+        mock_infrastructure.get_solar_storage_systems_in_area,
+        mock_infrastructure.get_water_storage_systems,
+        mock_infrastructure.get_power_plant_in_area,
+    ]
+    for getter in getters:
+        for area, filtered in [(None, False), (52353, True)]:
+            with (
+                patch("pandas.read_sql", return_value=pd.DataFrame()) as mr1,
+                patch("pandas.read_sql_query", return_value=pd.DataFrame()) as mr2,
+            ):
+                getter(area=area)
+            query = (mr1.call_args or mr2.call_args)[0][0]
+            assert ("Postleitzahl\" in ('52353')" in query) == filtered, (
+                getter.__name__,
+                area,
+            )
 
 
 def test_get_lat_lon_area(mock_infrastructure):
