@@ -494,43 +494,6 @@ def test_get_solar_series_clips_units_at_ac_capacity():
     assert np.allclose(solar.to_numpy(), expected)
 
 
-def test_get_solar_series_applies_losses_and_aging_before_clip():
-    # DC output is reduced by the inverter efficiency and by linear aging
-    # at the middle of the simulated period, the AC capacity clips afterwards
-    from assume.scenario.oeds.infrastructure import get_solar_series
-
-    index = pd.date_range("2020-06-21 11:00", periods=3, freq="h")
-    weather_df = pd.DataFrame(
-        {
-            "zenith": [93.0, 10.0, 93.0],
-            "azimuth": [180.0, 180.0, 180.0],
-            "dni": [0.0, 900.0, 0.0],
-            "ghi": [50.0, 450.0, 50.0],
-            "dhi": np.zeros(3),
-        },
-        index=index,
-    )
-    unit = pd.DataFrame({"azimuth": ["180"], "tilt": ["30"], "maxPower": [100.0]})
-    lossless = get_solar_series(unit, weather_df, inverter_efficiency=1.0)[0]
-
-    # commissioned ten years before the middle of the period
-    aged = unit.assign(startDate=pd.Timestamp("2010-06-21 12:00"))
-    solar = get_solar_series(aged, weather_df, inverter_efficiency=0.9)[0]
-    expected_factor = 0.9 * (1 - 0.005 * 3653 / 365.25)
-    assert np.allclose(solar, lossless * expected_factor)
-
-    # units commissioned after the period do not gain from negative aging
-    new = unit.assign(startDate=pd.Timestamp("2021-01-01"))
-    solar = get_solar_series(new, weather_df, inverter_efficiency=0.9)[0]
-    assert np.allclose(solar, lossless * 0.9)
-
-    # the AC capacity clips the output after losses
-    capped = unit.assign(acPower=60.0)
-    solar = get_solar_series(capped, weather_df, inverter_efficiency=0.9)[0]
-    assert np.allclose(solar, np.minimum(lossless * 0.9, 60.0))
-    assert (lossless * 0.9).max() > 60.0
-
-
 def test_wind_hub_height_and_diameter_are_filled_in_series(mock_infrastructure):
     # the query returns the raw MaStR values; missing hub heights and rotor
     # diameters are only filled for the simulation
@@ -568,3 +531,102 @@ def test_wind_hub_height_and_diameter_are_filled_in_series(mock_infrastructure):
         get_wind_series(turbines, weather_df), get_wind_series(filled, weather_df)
     )
     assert get_wind_series(turbines, weather_df).max() > 0
+
+
+def test_get_solar_series_applies_losses_and_aging_before_clip():
+    # DC output is reduced by the inverter efficiency and by linear aging
+    # at the middle of the simulated period, the AC capacity clips afterwards
+    from assume.scenario.oeds.infrastructure import get_solar_series
+
+    index = pd.date_range("2020-06-21 11:00", periods=3, freq="h")
+    weather_df = pd.DataFrame(
+        {
+            "zenith": [93.0, 10.0, 93.0],
+            "azimuth": [180.0, 180.0, 180.0],
+            "dni": [0.0, 900.0, 0.0],
+            "ghi": [50.0, 450.0, 50.0],
+            "dhi": np.zeros(3),
+        },
+        index=index,
+    )
+    unit = pd.DataFrame({"azimuth": ["180"], "tilt": ["30"], "maxPower": [100.0]})
+    lossless = get_solar_series(unit, weather_df, inverter_efficiency=1.0)[0]
+
+    # commissioned ten years before the middle of the period
+    aged = unit.assign(startDate=pd.Timestamp("2010-06-21 12:00"))
+    solar = get_solar_series(aged, weather_df, inverter_efficiency=0.9)[0]
+    expected_factor = 0.9 * (1 - 0.005 * 3653 / 365.25)
+    assert np.allclose(solar, lossless * expected_factor)
+
+    # units commissioned later in the period do not gain from negative aging
+    new = unit.assign(startDate=pd.Timestamp("2020-06-21 12:00"))
+    solar = get_solar_series(new, weather_df, inverter_efficiency=0.9)[0]
+    assert np.allclose(solar.iloc[1:], lossless.iloc[1:] * 0.9)
+
+    # the AC capacity clips the output after losses
+    capped = unit.assign(acPower=60.0)
+    solar = get_solar_series(capped, weather_df, inverter_efficiency=0.9)[0]
+    assert np.allclose(solar, np.minimum(lossless * 0.9, 60.0))
+    assert (lossless * 0.9).max() > 60.0
+
+
+def test_series_only_count_units_while_operating():
+    # a fleet growing within the simulated period must not be applied to
+    # the whole period: units produce from startDate until endDate only
+    from assume.scenario.oeds.infrastructure import get_solar_series, get_wind_series
+
+    index = pd.date_range("2020-06-21 10:00", periods=5, freq="h")
+    weather_df = pd.DataFrame(
+        {
+            "zenith": [30.0, 20.0, 10.0, 20.0, 30.0],
+            "azimuth": [180.0] * 5,
+            "dni": [700.0, 800.0, 900.0, 800.0, 700.0],
+            "ghi": [500.0, 550.0, 600.0, 550.0, 500.0],
+            "dhi": [100.0] * 5,
+            "temp_air": [290.0] * 5,
+            "wind_speed": [8.0] * 5,
+        },
+        index=index,
+    )
+    unit = {"azimuth": "180", "tilt": "30", "maxPower": 100.0, "batPower": 10.0}
+    always = pd.DataFrame([unit])
+    solar_always, battery_always = get_solar_series(always, weather_df)
+
+    systems = pd.DataFrame(
+        [
+            # commissioned before the period, decommissioned at 12:00
+            {
+                **unit,
+                "startDate": pd.Timestamp("2019-01-01"),
+                "endDate": pd.Timestamp("2020-06-21 12:00"),
+            },
+            # commissioned at 12:00 within the period
+            {**unit, "startDate": pd.Timestamp("2020-06-21 12:00"), "endDate": None},
+            # commissioned after the period
+            {**unit, "startDate": pd.Timestamp("2021-01-01"), "endDate": None},
+        ]
+    )
+    solar, battery = get_solar_series(systems, weather_df, aging_rate=0)
+    # exactly one of the three units operates at any time
+    assert np.allclose(solar, solar_always)
+    assert np.allclose(battery, battery_always)
+
+    turbine = {"maxPower": 2000.0, "height": 100.0, "diameter": 90.0}
+    wind_always = get_wind_series(pd.DataFrame([turbine]), weather_df)
+    turbines = pd.DataFrame(
+        [
+            {
+                **turbine,
+                "startDate": pd.Timestamp("2020-06-21 12:00"),
+                "endDate": pd.Timestamp("2050-01-01"),
+            },
+            {
+                **turbine,
+                "startDate": pd.Timestamp("2018-01-01"),
+                "endDate": pd.Timestamp("2020-06-21 13:00"),
+            },
+        ]
+    )
+    wind = get_wind_series(turbines, weather_df)
+    expected = wind_always * np.array([1, 1, 2, 1, 1])
+    assert np.allclose(wind, expected)

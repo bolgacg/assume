@@ -358,7 +358,8 @@ class InfrastructureInterface:
             f'"Leistungsbegrenzung" as "limited", '
             f'"Einspeisungsart" as "ownConsumption", '
             f'"HauptausrichtungNeigungswinkel" as "tiltCode", '
-            f'COALESCE("Inbetriebnahmedatum", \'2018-01-01\') as "startDate",'
+            f'COALESCE("Inbetriebnahmedatum", \'2018-01-01\') as "startDate", '
+            f'"DatumEndgueltigeStilllegung" as "endDate", '
             f'"InanspruchnahmeZahlungNachEeg" as "eeg" '
             f'FROM "solar_extended" '
             f'LEFT JOIN "solar_eeg" ON "EinheitMastrNummer" = "VerknuepfteEinheit" '
@@ -731,6 +732,7 @@ COALESCE(so."Leistungsbegrenzung", 'Nein') as "limited",
 COALESCE(so."Einspeisungsart", 'Teileinspeisung (einschließlich Eigenverbrauch)') as "ownConsumption",
 so."HauptausrichtungNeigungswinkel" as "tiltCode",
 COALESCE(so."Inbetriebnahmedatum", '2018-01-01') as "startDate",
+so."DatumEndgueltigeStilllegung" as "endDate",
 an."NutzbareSpeicherkapazitaet" as "VMax"
 FROM "storage_extended" spe
 INNER JOIN "solar_extended" so ON spe."LokationMastrNummer" = so."LokationMastrNummer"
@@ -963,7 +965,30 @@ ORDER BY 1
         return {}
 
 
+def naive_index(weather_df: pd.DataFrame) -> pd.DatetimeIndex:
+    """Returns the weather index without timezone, as MaStR dates carry none."""
+    index = weather_df.index
+    return index.tz_localize(None) if index.tz else index
+
+
+def operating_slice(index: pd.DatetimeIndex, start, end) -> slice:
+    """
+    Selects the time steps of a sorted index in which a unit operates,
+    start <= t < end. A missing start or end date does not restrict it.
+    """
+    first = index.searchsorted(pd.Timestamp(start)) if pd.notna(start) else 0
+    last = index.searchsorted(pd.Timestamp(end)) if pd.notna(end) else len(index)
+    return slice(first, last)
+
+
 def get_wind_series(wind_systems: pd.DataFrame, weather_df: pd.DataFrame):
+    """
+    Calculates the wind feed-in of the given turbines in kW.
+
+    Each turbine only produces between its startDate and endDate, if given,
+    so a fleet growing within the simulated period is not applied to the
+    whole period.
+    """
     data = [
         0.2 * np.ones(len(weather_df.index)),
         weather_df["temp_air"],
@@ -983,7 +1008,8 @@ def get_wind_series(wind_systems: pd.DataFrame, weather_df: pd.DataFrame):
 
     wt = WindTurbine(82, turbine_type="E-82/2300")
     # todo get wind turbine types from database
-    wind_power = pd.Series(0, weather_df.index)
+    wind_power = pd.Series(0.0, weather_df.index)
+    index = naive_index(weather_df)
     std_curve = wt.power_curve
     std_curve["value"] = std_curve["value"] / wt.power_curve["value"].max()
     # MaStR lacks some hub heights and rotor diameters, use the mean of the
@@ -1015,7 +1041,8 @@ def get_wind_series(wind_systems: pd.DataFrame, weather_df: pd.DataFrame):
         )
         mc = ModelChain(wt).run_model(ww)
         wpower = mc.power_output / 1e3  # [W] -> [kW]
-        wind_power += wpower
+        active = operating_slice(index, row.get("startDate"), row.get("endDate"))
+        wind_power.iloc[active] += wpower.iloc[active].to_numpy()
     return wind_power
 
 
@@ -1060,15 +1087,15 @@ def get_solar_series(
     by inverter_efficiency and, if startDate is given, by aging_rate per year
     of operation at the middle of the simulated period. Each unit's AC output
     is then clipped at its feed-in limit (limit_factor * maxPower) and its AC
-    capacity (acPower), if these columns are given.
+    capacity (acPower), if these columns are given. Each unit only produces
+    between its startDate and endDate, if given, so a fleet growing within
+    the simulated period is not applied to the whole period.
     """
-    solar_power = pd.Series(0.0, weather_df.index)
-    battery_power = pd.Series(0, weather_df.index)
     if solar_systems.empty:
-        return solar_power, battery_power
-    index = (
-        weather_df.index.tz_localize(None) if weather_df.index.tz else weather_df.index
-    )
+        return pd.Series(0.0, weather_df.index), pd.Series(0.0, weather_df.index)
+    solar_power = np.zeros(len(weather_df.index))
+    battery_power = np.zeros(len(weather_df.index))
+    index = naive_index(weather_df)
     mid_period = index[0] + (index[-1] - index[0]) / 2
     for info, group in tqdm(solar_systems.groupby(["azimuth", "tilt"])):
         azimuth = int(info[0])
@@ -1084,8 +1111,6 @@ def get_solar_series(
         if "startDate" in group.columns:
             age = (mid_period - pd.to_datetime(group["startDate"])).dt.days / 365.25
             rated_ac *= 1 - aging_rate * age.clip(lower=0).to_numpy()
-        if "batPower" in group.columns:
-            battery_power += group["batPower"].sum()
         system = PVSystem(
             surface_tilt=tilt,
             surface_azimuth=azimuth,
@@ -1103,8 +1128,27 @@ def get_solar_series(
         # feed-in limits and inverters clip the peak rather than scaling the
         # whole curve.
         share = ir["poa_global"].to_numpy() / 1e3
-        solar_power += clipped_feed_in(share, rated_ac, cap)
-    return solar_power, battery_power
+
+        # dates outside the period do not restrict the operation within it,
+        # and MaStR dates are daily, so few distinct operating periods remain
+        start = pd.to_datetime(pd.Series(group.get("startDate"), index=group.index))
+        end = pd.to_datetime(pd.Series(group.get("endDate"), index=group.index))
+        periods = pd.DataFrame(
+            {"start": start.where(start > index[0]), "end": end.where(end <= index[-1])}
+        )
+        for (start, end), units in periods.groupby(
+            ["start", "end"], dropna=False
+        ).indices.items():
+            active = operating_slice(index, start, end)
+            solar_power[active] += clipped_feed_in(
+                share[active], rated_ac[units], cap[units]
+            )
+            if "batPower" in group.columns:
+                battery_power[active] += group["batPower"].iloc[units].sum()
+    return (
+        pd.Series(solar_power, weather_df.index),
+        pd.Series(battery_power, weather_df.index),
+    )
 
 
 def get_pwp_agents(interface, areas):
