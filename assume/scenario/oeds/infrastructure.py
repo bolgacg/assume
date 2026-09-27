@@ -22,6 +22,7 @@ from assume.scenario.oeds.static import (
     mastr_solar_azimuth,
     mastr_solar_codes,
     mastr_solar_power_limit,
+    mastr_solar_tilt,
     mastr_storage,
     mastr_wind_type,
     technical_parameter,
@@ -43,6 +44,20 @@ MASTR_OPERATIONAL_STATUS = (
 )
 # Storage units were gated to "EinheitBetriebsstatus = 35" (In Betrieb only).
 MASTR_IN_OPERATION_STATUS = "'In Betrieb'"
+
+
+def map_mastr_codes(codes: pd.Series, mapping: dict, default: str) -> pd.Series:
+    """
+    Maps MaStR code values, which may carry stray whitespace, via mapping.
+
+    Missing codes get the default; unknown codes too, with a warning.
+    """
+    codes = codes.astype("string").str.strip()
+    mapped = codes.map(mapping)
+    unknown = codes[mapped.isna() & codes.notna()].unique()
+    if len(unknown):
+        logger.warning("unknown MaStR codes %s, using %s", list(unknown), default)
+    return mapped.fillna(default).astype(str)
 
 
 class InfrastructureInterface:
@@ -333,10 +348,10 @@ class InfrastructureInterface:
             f'"Breitengrad" as "lat", '
             f'"Postleitzahl" as "plzCode", '
             f'"Bundesland" as "state", '
-            f'COALESCE("Hauptausrichtung", \'Süd\') as "azimuthCode", '
+            f'"Hauptausrichtung" as "azimuthCode", '
             f'"Leistungsbegrenzung" as "limited", '
             f'"Einspeisungsart" as "ownConsumption", '
-            f'COALESCE("HauptausrichtungNeigungswinkel", \'21 - 40 Grad\') as "tiltCode", '
+            f'"HauptausrichtungNeigungswinkel" as "tiltCode", '
             f'COALESCE("Inbetriebnahmedatum", \'2018-01-01\') as "startDate",'
             f'"InanspruchnahmeZahlungNachEeg" as "eeg" '
             f'FROM "solar_extended" '
@@ -361,6 +376,38 @@ class InfrastructureInterface:
         if df.empty:
             return df
 
+        df["startDate"] = pd.to_datetime(df["startDate"])
+        df["ownConsumption"] = df["ownConsumption"].fillna(
+            (df["startDate"].dt.year > 2013).astype(int)
+        )
+
+        # the size thresholds below refer to the whole unit, so they have to
+        # run before _finish_solar_systems splits Ost-West units
+        if solar_type == "roof_top":
+            # all PVs with nan and startDate > 2012 and maxPower > 30 kWp are limited to 70%
+            missing = df["limited"].isna()
+            power_cap = df["maxPower"] > 30
+            deadline = df["startDate"].dt.year > 2012
+            df.loc[missing & deadline & power_cap, "limited"] = "Ja, auf 70%"
+
+        # nans have no limitation
+        df["limited"] = df["limited"].fillna("Nein")
+
+        # all PVs with nan and startDate > 2016 and maxPower > 100 kWp have direct marketing
+        missing = df["eeg"].isna()
+        power_cap = df["maxPower"] > 100
+        deadline = df["startDate"].dt.year > 2016
+        df.loc[missing & deadline & power_cap, "eeg"] = 0
+        # rest nans are eeg assets and are managed by the tso
+        df["eeg"] = df["eeg"].replace(np.nan, 0)
+
+        return self._finish_solar_systems(df, latitude, longitude)
+
+    def _finish_solar_systems(self, df, latitude, longitude):
+        """
+        Post-processing shared by the MaStR PV queries: coordinate fallback,
+        own consumption flag, feed-in limit, orientation and the Ost-West split.
+        """
         # Localized postcode centroid fallback
         df["plzCode_int"] = pd.to_numeric(df["plzCode"], errors="coerce")
         df["lon"] = df["lon"].fillna(df["plzCode_int"].map(self.plz_nuts["longitude"]))
@@ -369,12 +416,6 @@ class InfrastructureInterface:
         df["lat"] = df["lat"].fillna(latitude)
         del df["plzCode_int"]
 
-        # all PVs with are implemented in 2018
-        df["startDate"] = pd.to_datetime(df["startDate"])
-
-        df["ownConsumption"] = df["ownConsumption"].fillna(
-            (df["startDate"].dt.year > 2013).astype(int)
-        )
         df["ownConsumption"] = df["ownConsumption"].apply(
             lambda x: (
                 1
@@ -387,45 +428,39 @@ class InfrastructureInterface:
                 else 0
             )
         )
-        # all PVs with nan are south oriented assets
-        df["azimuth"] = [mastr_solar_azimuth[str(code)] for code in df["azimuthCode"]]
-        del df["azimuthCode"]
-        # all PVs with nan have a tilt angle of 30°
-        df["tilt"] = [mastr_solar_azimuth[str(code)] for code in df["tiltCode"]]
-        del df["tiltCode"]
-
-        if solar_type == "roof_top":
-            # all PVs with nan and startDate > 2012 and maxPower > 30 kWp are limited to 70%
-            missing = df["limited"].isna()  #
-            power_cap = df["maxPower"] > 30
-            deadline = df["startDate"].dt.year > 2012
-            limited = (
-                missing & deadline & power_cap
-            )  # to avoid key error after components are excluded
-            df.loc[limited, "limited"] = "Ja, auf 70%"
-
-        # nans have no limitation
-        df["limited"] = df["limited"].fillna("Nein")
         df["limit_factor"] = [
             mastr_solar_power_limit[str(code)] for code in df["limited"]
         ]
 
+        # PVs without orientation are south oriented with a tilt of 30°
+        df["azimuth"] = map_mastr_codes(
+            df.pop("azimuthCode"), mastr_solar_azimuth, "180"
+        )
+        df["tilt"] = map_mastr_codes(df.pop("tiltCode"), mastr_solar_tilt, "30")
+
         # apply limit to maxPower
         df["maxPower"] *= df["limit_factor"]
 
+        # Ost-West double-row systems cannot be represented by a single
+        # azimuth; split each unit into an east- and a west-facing row at
+        # half capacity. The (azimuth, tilt) groupby in get_solar_series
+        # then treats them as two separate orientations.
+        ew_mask = df["azimuth"].eq(mastr_solar_azimuth["Ost-West"])
+        if ew_mask.any():
+            ew = df[ew_mask].copy()
+            # halve every capacity so that totals, e.g. the battery power
+            # summed in get_solar_series, are not counted twice
+            for column in ["maxPower", "batPower", "VMax"]:
+                if column in ew.columns:
+                    ew[column] /= 2
+            ew = pd.concat(
+                [ew.assign(azimuth="90"), ew.assign(azimuth="270")],
+                ignore_index=True,
+            )
+            rest = df[~ew_mask]
+            df = pd.concat([rest, ew], ignore_index=True)
+
         df["demandP"] = df["maxPower"] * 1e3
-
-        # all PVs with nan and startDate > 2016 and maxPower > 100 kWp have direct marketing
-        missing = df["eeg"].isna()
-        power_cap = df["maxPower"] > 100
-        deadline = df["startDate"].dt.year > 2016
-        eeg = (
-            missing & deadline & power_cap
-        )  # to avoid key error after components are excluded
-
-        df.loc[eeg, "eeg"] = 0
-        # rest nans are eeg assets and are managed by the tso
-        df["eeg"] = df["eeg"].replace(np.nan, 0)
         return df
 
     def get_wind_turbines_in_area(
@@ -688,10 +723,10 @@ spe."Nettonennleistung" as "batPower",
 so."Laengengrad" as "lon",
 so."Breitengrad" as "lat",
 so."Postleitzahl" as "plzCode",
-COALESCE(so."Hauptausrichtung", 'Süd') as "azimuthCode",
+so."Hauptausrichtung" as "azimuthCode",
 COALESCE(so."Leistungsbegrenzung", 'Nein') as "limited",
 COALESCE(so."Einspeisungsart", 'Teileinspeisung (einschließlich Eigenverbrauch)') as "ownConsumption",
-COALESCE(so."HauptausrichtungNeigungswinkel", '21 - 40 Grad') as "tiltCode",
+so."HauptausrichtungNeigungswinkel" as "tiltCode",
 COALESCE(so."Inbetriebnahmedatum", '2018-01-01') as "startDate",
 an."NutzbareSpeicherkapazitaet" as "VMax"
 FROM "storage_extended" spe
@@ -714,44 +749,8 @@ WHERE so."EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS}
         if df.empty:
             return df
 
-        # Localized postcode centroid fallback
-        df["plzCode_int"] = pd.to_numeric(df["plzCode"], errors="coerce")
-        df["lon"] = df["lon"].fillna(df["plzCode_int"].map(self.plz_nuts["longitude"]))
-        df["lat"] = df["lat"].fillna(df["plzCode_int"].map(self.plz_nuts["latitude"]))
-        df["lon"] = df["lon"].fillna(longitude)
-        df["lat"] = df["lat"].fillna(latitude)
-        del df["plzCode_int"]
-
         df["VMax"] = df["VMax"].fillna(10)
-        df["ownConsumption"] = df["ownConsumption"].apply(
-            lambda x: (
-                1
-                if "Teileinspeisung" in str(x)
-                or "Eigenverbrauch" in str(x)
-                or str(x) == "689"
-                or str(x) == "1"
-                or x is True
-                or x == 1
-                else 0
-            )
-        )
-        df["limit_factor"] = [
-            mastr_solar_power_limit[str(code)] for code in df["limited"]
-        ]
-
-        # all PVs with nan are south oriented assets
-        df["azimuth"] = [mastr_solar_azimuth[str(code)] for code in df["azimuthCode"]]
-        del df["azimuthCode"]
-        # all PVs with nan have a tilt angle of 30°
-        df["tilt"] = [mastr_solar_azimuth[str(code)] for code in df["tiltCode"]]
-        del df["tiltCode"]
-
-        # apply limit to maxPower
-        df["maxPower"] *= df["limit_factor"]
-        # assumption "regenerative Energiesysteme":
-        # a year has 1000 hours peak
-        df["demandP"] = df["maxPower"] * 1e3
-
+        df = self._finish_solar_systems(df, latitude, longitude)
         df["eta"] = 0.96
         return df
 

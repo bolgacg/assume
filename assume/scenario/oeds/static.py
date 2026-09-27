@@ -60,15 +60,18 @@ mastr_solar_azimuth = {
     "West": "270",  # 701
     "Nord-West": "315",  # 702
     "nachgeführt": "180",  # Assumption: most pv are facing south#703
-    "Nachgeführt": "180",  # Assumption: most pv are facing south#703
     "Ost-West": "360",  # 704 half ost, half west
-    # Neigungswinkel
-    "90 Grad (vertikal) ": "90",  # 806
+}
+
+# HauptausrichtungNeigungswinkel, mapped to the class midpoints
+mastr_solar_tilt = {
+    "90 Grad (vertikal)": "90",  # 806
     "61 - 89 Grad": "75",  # 807
     "41 - 60 Grad": "50",  # 808
     "21 - 40 Grad": "30",  # 809
-    "5 - 20 Grad": "10",  # 810
-    "unter 5 Grad (horizontal)": "0",  # 811
+    "5 - 20 Grad": "13",  # 810
+    "unter 5 Grad (horizontal)": "3",  # 811
+    "Nachgeführt": "30",  # tracking is not modelled
 }
 
 # Power limit

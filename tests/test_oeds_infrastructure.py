@@ -227,3 +227,176 @@ def test_get_lat_lon_area(mock_infrastructure):
     # String postal code
     lat, lon = mock_infrastructure.get_lat_lon_area("52353")
     assert (lat, lon) == (50.0, 6.0)
+
+
+def test_get_solar_systems_in_area_power_cap_threshold(mock_infrastructure):
+    # A system with 120 kWp installed capacity and a 70% feed-in limit is
+    # scaled to 84 kWp in maxPower, but must still qualify for direct
+    # marketing based on its installed capacity (120 kWp > 100 kWp
+    # threshold), not the already-limited maxPower.
+    raw_df = pd.DataFrame(
+        {
+            "unitID": ["SEE12345"],
+            "maxPower": [120.0],
+            "lon": [6.0],
+            "lat": [50.0],
+            "plzCode": ["52353"],
+            "azimuthCode": ["Süd"],
+            "limited": ["Ja, auf 70%"],
+            "ownConsumption": [0],
+            "tiltCode": ["21 - 40 Grad"],
+            "startDate": [pd.to_datetime("2018-01-01")],
+            "eeg": [None],
+        }
+    )
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=raw_df):
+        result = mock_infrastructure.get_solar_systems_in_area(area=52353)
+
+        # maxPower is scaled by the feed-in limit: 120 * 0.7 = 84.0
+        assert result["maxPower"].iloc[0] == pytest.approx(84.0)
+        # demandP is in W: 84.0 * 1000 = 84000.0
+        assert result["demandP"].iloc[0] == pytest.approx(84000.0)
+        # limit_factor is carried for get_solar_series
+        assert result["limit_factor"].iloc[0] == 0.7
+        # eeg should be set to 0 (direct marketing) because installed capacity was 120 > 100
+        assert result["eeg"].iloc[0] == 0
+
+
+def test_get_solar_systems_in_area_ost_west_split(mock_infrastructure):
+    # An Ost-West double-row unit is split into a south-independent east
+    # (90) and west (270) orientation at half capacity each, so total
+    # capacity is preserved and the groupby in get_solar_series produces
+    # two separate orientations.
+    raw_df = pd.DataFrame(
+        {
+            "unitID": ["SEE10001", "SEE10002"],
+            "maxPower": [30.0, 30.0],
+            "lon": [6.0, 6.0],
+            "lat": [50.0, 50.0],
+            "plzCode": ["52353", "52353"],
+            "azimuthCode": ["Ost-West", "Süd"],
+            "limited": ["Nein", "Nein"],
+            "ownConsumption": [0, 0],
+            "tiltCode": ["21 - 40 Grad", "21 - 40 Grad"],
+            "startDate": [pd.to_datetime("2019-01-01"), pd.to_datetime("2019-01-01")],
+            "eeg": [None, 0],
+        }
+    )
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=raw_df):
+        result = mock_infrastructure.get_solar_systems_in_area(area=52353)
+
+        # total capacity unchanged
+        assert result["maxPower"].sum() == pytest.approx(60.0)
+        # Ost-West unit produced one east and one west row at half capacity
+        ew = result[(result["azimuth"] == "90") | (result["azimuth"] == "270")]
+        assert ew["maxPower"].tolist() == [15.0, 15.0]
+        assert result[result["azimuth"] == "180"]["maxPower"].iloc[0] == 30.0
+
+
+def test_map_mastr_orientation_codes(caplog):
+    from assume.scenario.oeds.infrastructure import map_mastr_codes
+    from assume.scenario.oeds.static import mastr_solar_azimuth, mastr_solar_tilt
+
+    tilt_codes = pd.Series(
+        [
+            "Nachgeführt",
+            "5 - 20 Grad",
+            "unter 5 Grad (horizontal)",
+            # MaStR carries a trailing space on this code
+            "90 Grad (vertikal) ",
+            None,
+            "unbekannt",
+        ]
+    )
+    with caplog.at_level("WARNING"):
+        tilt = map_mastr_codes(tilt_codes, mastr_solar_tilt, "30")
+    # tracked units keep the default tilt instead of the 180° azimuth value
+    assert tilt.tolist() == ["30", "13", "3", "90", "30", "30"]
+    # missing codes are silent, unknown codes are reported
+    assert "unbekannt" in caplog.text
+
+    azimuth_codes = pd.Series(["nachgeführt", "Süd-West", None])
+    azimuth = map_mastr_codes(azimuth_codes, mastr_solar_azimuth, "180")
+    assert azimuth.tolist() == ["180", "225", "180"]
+
+
+def test_get_solar_systems_in_area_ost_west_split_after_size_rules(
+    mock_infrastructure,
+):
+    # a 50 kWp Ost-West unit must get the 70% feed-in limit for units
+    # above 30 kWp before it is scaled and split into two 17.5 kWp rows
+    # (50 * 0.7 / 2)
+    raw_df = pd.DataFrame(
+        {
+            "unitID": ["SEE10001"],
+            "maxPower": [50.0],
+            "lon": [6.0],
+            "lat": [50.0],
+            "plzCode": ["52353"],
+            "azimuthCode": ["Ost-West"],
+            "limited": [None],
+            "ownConsumption": [None],
+            "tiltCode": [None],
+            "startDate": [pd.to_datetime("2019-01-01")],
+            "eeg": [None],
+        }
+    )
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=raw_df):
+        result = mock_infrastructure.get_solar_systems_in_area(area=52353)
+
+    assert result["maxPower"].tolist() == [17.5, 17.5]
+    assert result["limit_factor"].tolist() == [0.7, 0.7]
+    assert result["tilt"].tolist() == ["30", "30"]
+
+
+def test_get_solar_storage_ost_west_split_keeps_battery_totals(mock_infrastructure):
+    # the Ost-West split must not double the battery of a PV+battery unit,
+    # get_solar_series sums batPower per orientation group
+    raw_df = pd.DataFrame(
+        {
+            "unitID": ["SEL10001"],
+            "unitMastrID": ["SSE10001"],
+            "maxPower": [10.0],
+            "batPower": [5.0],
+            "lon": [6.0],
+            "lat": [50.0],
+            "plzCode": ["52353"],
+            "azimuthCode": ["Ost-West"],
+            "limited": ["Nein"],
+            "ownConsumption": ["Teileinspeisung (einschließlich Eigenverbrauch)"],
+            "tiltCode": ["21 - 40 Grad"],
+            "startDate": ["2020-01-01"],
+            "VMax": [8.0],
+        }
+    )
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=raw_df):
+        result = mock_infrastructure.get_solar_storage_systems_in_area(area=52353)
+
+    assert sorted(result["azimuth"]) == ["270", "90"]
+    assert result["maxPower"].sum() == pytest.approx(10.0)
+    assert result["batPower"].sum() == pytest.approx(5.0)
+    assert result["VMax"].sum() == pytest.approx(8.0)
