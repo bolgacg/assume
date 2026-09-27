@@ -106,6 +106,48 @@ def test_get_power_plant_in_area_queries(mock_infrastructure):
         assert 'FROM "nuclear_extended" ev' in query_nuclear
 
 
+def test_get_power_plant_in_area_cchp_parameters(mock_infrastructure):
+    # Test that CCHP units receive 'gas_combined' technical parameters instead of standard 'gas'
+    cchp_df = pd.DataFrame(
+        {
+            "unitID": ["SEE1001", "SEE1002"],
+            "fuel": ["gas", "gas"],
+            "lon": [6.0, 6.0],
+            "lat": [50.0, 50.0],
+            "startDate": [pd.to_datetime("2010-01-01"), pd.to_datetime("2010-01-01")],
+            "endDate": [pd.to_datetime("2040-01-01"), pd.to_datetime("2040-01-01")],
+            "maxPower": [20000.0, 30000.0],
+            "turbineTyp": [
+                "Closed Cycle Heat Power",
+                "Kondensationsmaschine ohne Entnahme",
+            ],
+            "generatorID": [10, 0],
+            "kwkPowerTherm": [5000.0, 0.0],
+            "kwkPowerElec": [4000.0, 0.0],
+            "combination": [1, 0],
+        }
+    )
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=cchp_df):
+        result = mock_infrastructure.get_power_plant_in_area(
+            area=52353, fuel_type="gas"
+        )
+
+        # The aggregated CCHP row should have fuel == 'gas_combined'
+        cchp_row = result[result["fuel"] == "gas_combined"].iloc[0]
+        assert cchp_row["fuel"] == "gas_combined"
+        # Ramp up for gas_combined (2000) is 4% per min -> 4 * 60 / 100 = 2.4 * maxPower
+        # For standard gas (2000), ramp up is 12% per min -> 12 * 60 / 100 = 7.2 * maxPower
+        assert cchp_row["ramp_up"] == pytest.approx(
+            cchp_row["maxPower"] * 4.0 * 60 / 100
+        )
+
+
 def test_asset_queries_with_string_plz(mock_infrastructure):
     # Verify string postal codes work across all asset query methods without 'invalid plz code' exception
     mock_conn = MagicMock()
@@ -228,6 +270,28 @@ def test_get_lat_lon_area(mock_infrastructure):
     # String postal code
     lat, lon = mock_infrastructure.get_lat_lon_area("52353")
     assert (lat, lon) == (50.0, 6.0)
+
+
+def test_get_solar_storage_systems_in_area_stopped_after(mock_infrastructure):
+    from datetime import datetime
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=pd.DataFrame()) as mock_read_sql:
+        cutoff = datetime(2023, 1, 1)
+        mock_infrastructure.get_solar_storage_systems_in_area(
+            area=52353, stopped_after=cutoff
+        )
+
+        mock_read_sql.assert_called_once()
+        query = mock_read_sql.call_args[0][0]
+        assert (
+            'AND (so."DatumEndgueltigeStilllegung" IS NULL OR so."DatumEndgueltigeStilllegung" > \'2023-01-01T00:00:00\')'
+            in query
+        )
 
 
 def test_get_solar_systems_in_area_power_cap_threshold(mock_infrastructure):
@@ -400,6 +464,61 @@ def test_get_solar_storage_ost_west_split_keeps_battery_totals(mock_infrastructu
     assert result["maxPower"].sum() == pytest.approx(10.0)
     assert result["batPower"].sum() == pytest.approx(5.0)
     assert result["VMax"].sum() == pytest.approx(8.0)
+
+
+def test_get_solar_systems_in_area_rejects_unknown_solar_type(mock_infrastructure):
+    with pytest.raises(ValueError, match="water"):
+        mock_infrastructure.get_solar_systems_in_area(area=52353, solar_type="water")
+
+
+@pytest.mark.parametrize(
+    "fuel_type, mastr_label",
+    [
+        ("lignite", "Braunkohle"),
+        ("hard coal", "Steinkohle"),
+        ("nuclear", "Kernenergie"),
+    ],
+)
+def test_get_power_plant_in_area_uses_fuel_parameters(
+    mock_infrastructure, fuel_type, mastr_label
+):
+    # MaStR returns German fuel labels; the technical parameters must still
+    # be looked up by the internal fuel name, not fall back to gas_combined
+    from assume.scenario.oeds.static import technical_parameter
+
+    raw_df = pd.DataFrame(
+        {
+            "unitID": ["SEE1001"],
+            "fuel": [mastr_label],
+            "lon": [6.0],
+            "lat": [50.0],
+            "startDate": [pd.to_datetime("2010-01-01")],
+            "endDate": [pd.to_datetime("2040-01-01")],
+            "maxPower": [500000.0],
+            "turbineTyp": ["Kondensationsmaschine ohne Entnahme"],
+            "generatorID": [0],
+        }
+    )
+    if fuel_type != "nuclear":
+        raw_df["kwkPowerTherm"] = [0.0]
+        raw_df["kwkPowerElec"] = [0.0]
+        raw_df["combination"] = [None]
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=raw_df):
+        result = mock_infrastructure.get_power_plant_in_area(
+            area=52353, fuel_type=fuel_type
+        )
+
+    params = technical_parameter[fuel_type][2000]
+    row = result.iloc[0]
+    assert row["fuel"] == fuel_type
+    assert row["eta"] == pytest.approx(params["eta"] / 100)
+    assert row["minPower"] == pytest.approx(500000.0 * params["minPower"] / 100)
 
 
 def test_get_solar_series_applies_feed_in_limit_as_peak_clip():

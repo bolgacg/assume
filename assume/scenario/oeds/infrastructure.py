@@ -310,8 +310,9 @@ class InfrastructureInterface:
 
         for line, row in df.iterrows():
             type_year = row["type"]
-            if fuel_type in technical_parameter:
-                tech_params = technical_parameter[fuel_type][type_year]
+            current_fuel = row.get("fuel", fuel_type)
+            if current_fuel in technical_parameter:
+                tech_params = technical_parameter[current_fuel][type_year]
             else:
                 tech_params = technical_parameter["gas_combined"][0]
 
@@ -344,6 +345,12 @@ class InfrastructureInterface:
     def get_solar_systems_in_area(
         self, area=520, solar_type="roof_top", created_before=None, stopped_after=None
     ):
+        if solar_type and solar_type not in mastr_solar_codes:
+            # open-mastr has no ArtDerSolaranlage labels for the former
+            # water (3002) and parking lot (3058) codes
+            raise ValueError(
+                f"unknown solar_type {solar_type}, use one of {list(mastr_solar_codes)} or None"
+            )
         plz_codes_str, latitude, longitude = self.resolve_area(area)
 
         query = (
@@ -744,7 +751,7 @@ WHERE so."EinheitBetriebsstatus" IN {MASTR_OPERATIONAL_STATUS}
         if created_before:
             query += f"AND so.\"Inbetriebnahmedatum\" < '{created_before.isoformat()}' "
         if stopped_after:
-            query += f'AND (so."DatumEndgueltigeStilllegung" IS NULL OR so."DatumEndgueltigeStilllegung" <= \'{stopped_after.isoformat()}\')'
+            query += f'AND (so."DatumEndgueltigeStilllegung" IS NULL OR so."DatumEndgueltigeStilllegung" > \'{stopped_after.isoformat()}\')'
 
         # Get Data from Postgres
         with self.databases["mastr"].connect() as conn:
