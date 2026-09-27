@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import logging
-import math
 from datetime import datetime, timedelta
 
 import holidays
@@ -521,14 +520,6 @@ class InfrastructureInterface:
         df["lon"] = df["lon"].fillna(longitude)
         df["lat"] = df["lat"].fillna(latitude)
         del df["plzCode_int"]
-        # all WEA with nan set height to mean value
-        if math.isnan(df["height"].mean()):
-            mean_height = 80
-        else:
-            mean_height = df["height"].mean() == float("nan")
-        df["height"] = df["height"].fillna(mean_height)
-        # all WEA with nan set height to mean diameter
-        df["diameter"] = df["diameter"].fillna(df["diameter"].mean())
         # all WEA with na are on shore and not allocated to a sea cluster
         # set tag for wind farms
         wind_farm_prefix = f"{area or 'DE'}0F"
@@ -995,10 +986,16 @@ def get_wind_series(wind_systems: pd.DataFrame, weather_df: pd.DataFrame):
     wind_power = pd.Series(0, weather_df.index)
     std_curve = wt.power_curve
     std_curve["value"] = std_curve["value"] / wt.power_curve["value"].max()
+    # MaStR lacks some hub heights and rotor diameters, use the mean of the
+    # given systems, 80 m hub height if none is known
+    heights = wind_systems["height"].astype(float)
+    heights = heights.fillna(heights.mean() if heights.notna().any() else 80)
+    diameters = wind_systems["diameter"].astype(float)
+    diameters = diameters.fillna(diameters.mean()).fillna(heights)
     for line, row in tqdm(wind_systems.iterrows(), total=len(wind_systems)):
         max_power = row["maxPower"] * 1e3
-        diameter = float(row["diameter"])
-        height = float(row["height"])
+        diameter = diameters[line]
+        height = heights[line]
         if height <= 0:
             # weird fix
             height = max_power / 20

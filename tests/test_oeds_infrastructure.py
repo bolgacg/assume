@@ -529,3 +529,42 @@ def test_get_solar_series_applies_losses_and_aging_before_clip():
     solar = get_solar_series(capped, weather_df, inverter_efficiency=0.9)[0]
     assert np.allclose(solar, np.minimum(lossless * 0.9, 60.0))
     assert (lossless * 0.9).max() > 60.0
+
+
+def test_wind_hub_height_and_diameter_are_filled_in_series(mock_infrastructure):
+    # the query returns the raw MaStR values; missing hub heights and rotor
+    # diameters are only filled for the simulation
+    from assume.scenario.oeds.infrastructure import get_wind_series
+
+    raw_df = pd.DataFrame(
+        {
+            "unitID": ["SEE1", "SEE2"],
+            "maxPower": [2000.0, 2000.0],
+            "lon": [6.0, 6.0],
+            "lat": [50.0, 50.0],
+            "plzCode": ["52353", "52353"],
+            "height": [100.0, None],
+            "diameter": [None, 90.0],
+            "generatorID": [None, None],
+        }
+    )
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql_query", return_value=raw_df):
+        turbines = mock_infrastructure.get_wind_turbines_in_area(area=52353)
+    assert turbines["height"].isna().tolist() == [False, True]
+    assert turbines["diameter"].isna().tolist() == [True, False]
+
+    index = pd.date_range("2020-01-01", periods=3, freq="h")
+    weather_df = pd.DataFrame(
+        {"temp_air": [280.0] * 3, "wind_speed": [3.0, 8.0, 12.0]}, index=index
+    )
+    filled = turbines.fillna({"height": 100.0, "diameter": 90.0})
+    assert np.allclose(
+        get_wind_series(turbines, weather_df), get_wind_series(filled, weather_df)
+    )
+    assert get_wind_series(turbines, weather_df).max() > 0
