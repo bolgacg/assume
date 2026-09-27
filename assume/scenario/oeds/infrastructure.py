@@ -413,15 +413,25 @@ class InfrastructureInterface:
         deadline = df["startDate"].dt.year > 2016
         df.loc[missing & deadline & power_cap, "eeg"] = 0
         # rest nans are eeg assets and are managed by the tso
-        df["eeg"] = df["eeg"].replace(np.nan, 0)
+        # InanspruchnahmeZahlungNachEeg is boolean in the database, so filling it
+        # with 0 leaves a mixed bool/int object column that cannot be serialized
+        df["eeg"] = df["eeg"].fillna(0).astype(bool).astype(int)
 
         return self._finish_solar_systems(df, latitude, longitude)
 
     def _finish_solar_systems(self, df, latitude, longitude):
         """
-        Post-processing shared by the MaStR PV queries: coordinate fallback,
-        own consumption flag, feed-in limit, orientation and the Ost-West split.
+        Post-processing shared by the MaStR PV queries: operating dates,
+        coordinate fallback, own consumption flag, feed-in limit, orientation
+        and the Ost-West split.
         """
+        # DatumEndgueltigeStilllegung is NULL for every unit still standing, so
+        # without this the column stays an object mix of dates and None that
+        # pandas cannot serialize. Both dates are optional, as in get_solar_series.
+        for column in ["startDate", "endDate"]:
+            if column in df.columns:
+                df[column] = pd.to_datetime(df[column])
+
         # Localized postcode centroid fallback
         df["plzCode_int"] = pd.to_numeric(df["plzCode"], errors="coerce")
         df["lon"] = df["lon"].fillna(df["plzCode_int"].map(self.plz_nuts["longitude"]))

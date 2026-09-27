@@ -749,3 +749,47 @@ def test_series_only_count_units_while_operating():
     wind = get_wind_series(turbines, weather_df)
     expected = wind_always * np.array([1, 1, 2, 1, 1])
     assert np.allclose(wind, expected)
+
+
+def test_get_solar_systems_in_area_returns_serializable_columns(
+    mock_infrastructure, tmp_path
+):
+    # InanspruchnahmeZahlungNachEeg is boolean and DatumEndgueltigeStilllegung is
+    # NULL for units still standing, so both came back as object columns mixing
+    # types, which pandas refuses to write to parquet. Callers caching the fleet
+    # for an offline run need the frame to round-trip.
+    raw_df = pd.DataFrame(
+        {
+            "unitID": ["SEE10001", "SEE10002"],
+            "maxPower": [30.0, 3000.0],
+            "acPower": [28.0, 2800.0],
+            "lon": [6.0, 6.0],
+            "lat": [50.0, 50.0],
+            "plzCode": ["52353", "52353"],
+            "azimuthCode": ["Süd", "Süd"],
+            "limited": ["Nein", None],
+            "ownConsumption": [0, 0],
+            "tiltCode": ["21 - 40 Grad", "21 - 40 Grad"],
+            "startDate": ["2019-01-01", "2019-01-01"],
+            "endDate": [None, "2023-06-01"],
+            "eeg": [True, None],
+        }
+    )
+
+    mock_conn = MagicMock()
+    mock_infrastructure.databases[
+        "mastr"
+    ].connect.return_value.__enter__.return_value = mock_conn
+
+    with patch("pandas.read_sql", return_value=raw_df):
+        result = mock_infrastructure.get_solar_systems_in_area(area=52353)
+
+    assert result["eeg"].tolist() == [1, 0]
+    assert pd.api.types.is_integer_dtype(result["eeg"])
+    assert pd.api.types.is_datetime64_any_dtype(result["startDate"])
+    assert pd.api.types.is_datetime64_any_dtype(result["endDate"])
+    assert result["endDate"].isna().tolist() == [True, False]
+
+    path = tmp_path / "solar.parquet"
+    result.to_parquet(path)
+    assert len(pd.read_parquet(path)) == len(result)
